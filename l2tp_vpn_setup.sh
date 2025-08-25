@@ -110,12 +110,11 @@ iptables -A INPUT -p udp --dport 1701 -j ACCEPT
 iptables -A INPUT -p udp --dport 4500 -m policy --dir in --pol ipsec -j ACCEPT
 netfilter-persistent save
 
-# 启动服务 (添加兼容性检查)
+# 启动服务 (新版兼容性检查)
 echo "--- 正在启动服务..."
-# 检查 strongswan 服务名称，兼容不同版本
-if systemctl list-units --type=service | grep -q strongswan; then
+if [ -f /lib/systemd/system/strongswan.service ]; then
     SERVICE_NAME="strongswan"
-elif systemctl list-units --type=service | grep -q ipsec; then
+elif [ -f /lib/systemd/system/ipsec.service ]; then
     SERVICE_NAME="ipsec"
 else
     echo "错误：未找到 strongswan 或 ipsec 服务。请检查 strongswan 软件包是否已成功安装。"
