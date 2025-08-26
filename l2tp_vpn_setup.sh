@@ -29,8 +29,8 @@ conn L2TP-PSK
     authby=secret
     auto=add
     keyexchange=ikev1
-    ike=aes256-sha1-modp1024!
-    esp=aes256-sha1!
+    ike=aes128-sha1-modp1024,3des-sha1-modp1024!
+    esp=aes128-sha1,3des-sha1!
     type=transport
     left=%any
     leftid=$PUBLIC_IP
