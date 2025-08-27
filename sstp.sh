@@ -1,15 +1,18 @@
 #!/bin/bash
 
 # ======================================
-# SSTP VPN 一键安装脚本 (Ubuntu)
-# 功能:
+# 完整版 SSTP VPN 一键安装脚本 (Ubuntu)
+# 增强功能：
 # - 自动安装依赖
-# - 编译 SSTP Server
 # - 生成自签名证书
 # - 创建用户 user1~user10，密码 password
 # - 配置 systemd 开机自启
-# - 启动并检测服务
-# - 记录日志到 /var/log/sstpd.log
+# - 配置防火墙
+# - 启动服务
+# - 自动检测 TCP 443 监听状态
+# - 自动检测公网 IP
+# - 输出最终连接信息
+# - 解决卡屏问题（超时检测）
 # ======================================
 
 set -e
@@ -19,7 +22,7 @@ echo "SSTP VPN 一键安装脚本"
 echo "======================================"
 
 # -------------------------
-# 1. 检测 root 权限
+# 1. 检查 root 权限
 # -------------------------
 if [ "$(id -u)" -ne 0 ]; then
     echo "请使用 root 用户运行此脚本！"
@@ -33,8 +36,7 @@ echo "[*] 更新系统并安装依赖..."
 apt update -y
 apt upgrade -y
 
-# 检查依赖是否已安装
-deps=(build-essential libssl-dev libreadline-dev libncurses5-dev libpam0g-dev libpcap-dev git wget curl iptables-persistent)
+deps=(build-essential libssl-dev libreadline-dev libncurses-dev libpam0g-dev libpcap-dev git wget curl iptables-persistent netcat)
 for pkg in "${deps[@]}"; do
     if ! dpkg -s $pkg &> /dev/null; then
         echo "[*] 安装依赖: $pkg"
@@ -70,7 +72,6 @@ mkdir -p /etc/ssl/sstp
 openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
     -subj "/C=US/ST=CA/L=SanFrancisco/O=MyVPN/OU=IT/CN=sstp.local" \
     -keyout /etc/ssl/sstp/server.key -out /etc/ssl/sstp/server.crt
-
 chmod 600 /etc/ssl/sstp/server.key /etc/ssl/sstp/server.crt
 echo "[✅] 证书生成完成: /etc/ssl/sstp/server.crt"
 
@@ -135,24 +136,57 @@ iptables-save > /etc/iptables/rules.v4
 echo "[✅] 防火墙配置完成"
 
 # -------------------------
-# 9. 检测服务状态
+# 9. 自动检测服务可用性（加超时避免卡屏）
 # -------------------------
 sleep 3
-echo "[*] 检测 SSTP 服务是否监听 TCP 443..."
-if netstat -tulnp | grep ':443' &> /dev/null; then
-    echo "[✅] SSTP 服务已启动并监听 TCP 443"
+echo "[*] 检测 SSTP 服务状态..."
+
+can_connect=0
+
+# 检查 sstpd 进程
+if pgrep sstpd &> /dev/null; then
+    echo "[✅] SSTP 服务进程运行中"
 else
-    echo "[❌] SSTP 服务未成功启动"
-    echo "请检查日志: journalctl -u sstpd -f 或 /var/log/sstpd.log"
+    echo "[❌] SSTP 服务未运行"
+fi
+
+# 检查端口监听
+if ss -tulnp | grep ':443' &> /dev/null; then
+    echo "[✅] TCP 443 正在监听"
+    # 使用超时方式检测本地 TCP 连接
+    if timeout 5 nc -z 127.0.0.1 443 &> /dev/null; then
+        echo "[✅] 本地 TCP 连接测试成功，可以直接连接客户端"
+        can_connect=1
+    else
+        echo "[⚠️] 本地 TCP 连接失败，可能防火墙或服务异常"
+    fi
+else
+    echo "[❌] TCP 443 未监听，客户端无法连接"
 fi
 
 # -------------------------
-# 10. 完成提示
+# 10. 检测公网 IP（加超时避免卡屏）
+# -------------------------
+echo "[*] 检测公网 IP..."
+public_ip=$(curl -s --max-time 5 https://ipinfo.io/ip || curl -s --max-time 5 https://ifconfig.me || echo "无法获取公网 IP")
+if [ "$public_ip" = "" ]; then
+    public_ip="无法获取公网 IP"
+fi
+
+# -------------------------
+# 11. 输出最终信息
 # -------------------------
 echo "======================================"
 echo "SSTP VPN 安装完成！"
-echo "用户: user1~user10"
-echo "密码: password"
-echo "日志: /var/log/sstpd.log"
-echo "请使用 TCP 443 连接 SSTP"
+echo "1. 你的公网 IP: $public_ip"
+echo "2. 用户名: user1~user10"
+echo "3. 密码: password"
+
+if [ $can_connect -eq 1 ]; then
+    echo "[✅] 服务可以直接连接，客户端可立即使用"
+else
+    echo "[⚠️] 服务未完全可用，请检查日志: /var/log/sstpd.log 或 journalctl -u sstpd -f"
+fi
+
+echo "TCP 端口: 443"
 echo "======================================"
