@@ -2,17 +2,9 @@
 
 # ======================================
 # 完整版 SSTP VPN 一键安装脚本 (Ubuntu)
-# 增强功能：
-# - 自动安装依赖
-# - 生成自签名证书
-# - 创建用户 user1~user10，密码 password
-# - 配置 systemd 开机自启
-# - 配置防火墙
-# - 启动服务
-# - 自动检测 TCP 443 监听状态
-# - 自动检测公网 IP
-# - 输出最终连接信息
-# - 解决卡屏问题（超时检测）
+# 修改内容：
+# - 将 netcat 替换为 netcat-openbsd
+# - 保留所有功能和超时检测
 # ======================================
 
 set -e
@@ -36,7 +28,7 @@ echo "[*] 更新系统并安装依赖..."
 apt update -y
 apt upgrade -y
 
-deps=(build-essential libssl-dev libreadline-dev libncurses-dev libpam0g-dev libpcap-dev git wget curl iptables-persistent netcat)
+deps=(build-essential libssl-dev libreadline-dev libncurses-dev libpam0g-dev libpcap-dev git wget curl iptables-persistent netcat-openbsd)
 for pkg in "${deps[@]}"; do
     if ! dpkg -s $pkg &> /dev/null; then
         echo "[*] 安装依赖: $pkg"
