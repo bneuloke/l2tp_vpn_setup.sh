@@ -1,0 +1,517 @@
+#!/bin/bash
+
+# Private 5ber Deployment Script - All Ports Modified
+# Version: 3.0
+# All services use non-standard ports (20000+)
+set -e
+
+# Configuration
+DOMAIN="wrxilove.dpdns.org"
+EMAIL="admin@$DOMAIN"
+INSTALL_DIR="/opt/private-5ber"
+WEB_PORT="20080"
+DB_PORT="23456"
+REDIS_PORT="25678"
+NGINX_PORT="28080"
+SSL_PORT="28443"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Function to print colored output
+print_status() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+   print_error "This script must be run as root"
+   exit 1
+fi
+
+# Update system
+print_status "Updating system packages..."
+apt-get update
+apt-get upgrade -y
+
+# Install dependencies
+print_status "Installing dependencies..."
+apt-get install -y docker.io docker-compose nginx certbot python3-certbot-nginx git curl wget
+
+# Create installation directory
+print_status "Creating installation directory..."
+mkdir -p $INSTALL_DIR
+cd $INSTALL_DIR
+
+# Create .env file with random passwords
+print_status "Creating environment configuration..."
+cat > .env << EOF
+FLASK_APP=app.py
+FLASK_ENV=production
+SECRET_KEY=$(openssl rand -hex 32)
+DB_PASSWORD=$(openssl rand -hex 16)
+REDIS_PASSWORD=$(openssl rand -hex 16)
+DOMAIN=$DOMAIN
+EMAIL=$EMAIL
+WEB_PORT=$WEB_PORT
+DB_PORT=$DB_PORT
+REDIS_PORT=$REDIS_PORT
+NGINX_PORT=$NGINX_PORT
+SSL_PORT=$SSL_PORT
+EOF
+
+# Create docker-compose.yml
+print_status "Creating Docker Compose configuration..."
+cat > docker-compose.yml << EOF
+version: '3.8'
+
+services:
+  db:
+    image: postgres:13
+    environment:
+      POSTGRES_DB: esim_db
+      POSTGRES_USER: esim_user
+      POSTGRES_PASSWORD: \${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "$DB_PORT:5432"
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:6-alpine
+    command: redis-server --requirepass \${REDIS_PASSWORD}
+    ports:
+      - "$REDIS_PORT:6379"
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  web:
+    build: .
+    ports:
+      - "$WEB_PORT:5000"
+    environment:
+      - FLASK_ENV=production
+      - DATABASE_URL=postgresql://esim_user:\${DB_PASSWORD}@db:5432/esim_db
+      - REDIS_URL=redis://:\${REDIS_PASSWORD}@redis:6379/0
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      - db
+      - redis
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    ports:
+      - "$NGINX_PORT:80"
+      - "$SSL_PORT:443"
+    depends_on:
+      - web
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+EOF
+
+# Create nginx.conf
+print_status "Creating Nginx configuration..."
+cat > nginx.conf << EOF
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream web {
+        server web:5000;
+    }
+
+    server {
+        listen $NGINX_PORT;
+        server_name $DOMAIN;
+        return 301 https://\$server_name\$request_uri;
+    }
+
+    server {
+        listen $SSL_PORT ssl;
+        server_name $DOMAIN;
+
+        ssl_certificate /etc/nginx/ssl/cert.pem;
+        ssl_certificate_key /etc/nginx/ssl/key.pem;
+
+        location / {
+            proxy_pass http://web;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+        }
+    }
+}
+EOF
+
+# Create Flask application
+print_status "Creating Flask application..."
+mkdir -p app templates uploads
+
+cat > app/app.py << EOF
+import os
+import uuid
+from flask import Flask, render_template, request, redirect, url_for, send_from_directory
+from werkzeug.utils import secure_filename
+from flask_sqlalchemy import SQLAlchemy
+from flask_redis import FlaskRedis
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['REDIS_URL'] = os.environ.get('REDIS_URL')
+
+db = SQLAlchemy(app)
+redis = FlaskRedis(app)
+
+# Configure upload folder
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'json', 'der', 'pem'}
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# Ensure upload folder exists
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# Database model
+class EsimProfile(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    filename = db.Column(db.String(255), nullable=False)
+    original_filename = db.Column(db.String(255), nullable=False)
+    activation_code = db.Column(db.String(255), unique=True, nullable=False)
+    download_count = db.Column(db.Integer, default=0)
+
+    def __repr__(self):
+        return f'<EsimProfile {self.filename}>'
+
+# Create tables
+with app.app_context():
+    db.create_all()
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+@app.route('/')
+def index():
+    profiles = EsimProfile.query.all()
+    return render_template('index.html', profiles=profiles)
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return redirect(request.url)
+    
+    file = request.files['file']
+    if file.filename == '':
+        return redirect(request.url)
+    
+    if file and allowed_file(file.filename):
+        original_filename = secure_filename(file.filename)
+        file_extension = original_filename.rsplit('.', 1)[1].lower()
+        unique_filename = f"{uuid.uuid4().hex}.{file_extension}"
+        activation_code = f"AC-{uuid.uuid4().hex[:8].upper()}"
+        
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+        file.save(file_path)
+        
+        # Save to database
+        new_profile = EsimProfile(
+            filename=unique_filename,
+            original_filename=original_filename,
+            activation_code=activation_code
+        )
+        db.session.add(new_profile)
+        db.session.commit()
+        
+        return redirect(url_for('index'))
+    
+    return redirect(request.url)
+
+@app.route('/download/<activation_code>')
+def download_file(activation_code):
+    profile = EsimProfile.query.filter_by(activation_code=activation_code).first_or_404()
+    
+    # Increment download count
+    profile.download_count += 1
+    db.session.commit()
+    
+    return send_from_directory(app.config['UPLOAD_FOLDER'], profile.filename, as_attachment=True)
+
+@app.route('/delete/<int:profile_id>')
+def delete_profile(profile_id):
+    profile = EsimProfile.query.get_or_404(profile_id)
+    
+    # Delete file
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], profile.filename)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    
+    # Delete from database
+    db.session.delete(profile)
+    db.session.commit()
+    
+    return redirect(url_for('index'))
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+EOF
+
+# Create requirements.txt
+cat > requirements.txt << EOF
+Flask==2.0.1
+Flask-SQLAlchemy==2.5.1
+Flask-Redis==0.4.0
+Werkzeug==2.0.1
+psycopg2-binary==2.9.1
+redis==3.5.3
+gunicorn==20.1.0
+EOF
+
+# Create Dockerfile
+cat > Dockerfile << EOF
+FROM python:3.9-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 5000
+
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
+EOF
+
+# Create HTML template
+cat > app/templates/index.html << EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Private 5ber eSIM Manager</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        h1, h2 {
+            color: #333;
+        }
+        .container {
+            background-color: #f9f9f9;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        tr:hover {
+            background-color: #f5f5f5;
+        }
+        .btn {
+            display: inline-block;
+            background-color: #4CAF50;
+            color: white;
+            padding: 8px 16px;
+            text-align: center;
+            text-decoration: none;
+            border-radius: 4px;
+            margin-right: 5px;
+        }
+        .btn-danger {
+            background-color: #f44336;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="file"] {
+            padding: 8px;
+            width: 100%;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .notification {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+    </style>
+</head>
+<body>
+    <h1>Private 5ber eSIM Manager</h1>
+    
+    <div class="container">
+        <h2>Upload New eSIM Profile</h2>
+        <form method="post" enctype="multipart/form-data" action="/upload">
+            <div class="form-group">
+                <label for="file">Select eSIM Profile File:</label>
+                <input type="file" name="file" id="file" required>
+            </div>
+            <button type="submit" class="btn">Upload</button>
+        </form>
+    </div>
+    
+    <div class="container">
+        <h2>Available eSIM Profiles</h2>
+        {% if profiles %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Filename</th>
+                        <th>Activation Code</th>
+                        <th>Downloads</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for profile in profiles %}
+                    <tr>
+                        <td>{{ profile.original_filename }}</td>
+                        <td>{{ profile.activation_code }}</td>
+                        <td>{{ profile.download_count }}</td>
+                        <td>
+                            <a href="/download/{{ profile.activation_code }}" class="btn">Download</a>
+                            <a href="/delete/{{ profile.id }}" class="btn btn-danger" onclick="return confirm('Are you sure?')">Delete</a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <p>No eSIM profiles available. Upload one to get started.</p>
+        {% endif %}
+    </div>
+    
+    <div class="container">
+        <h2>How to Use</h2>
+        <ol>
+            <li>Upload your eSIM profile file (JSON, DER, or PEM format)</li>
+            <li>Once uploaded, you'll get an activation code</li>
+            <li>Share the download link with the activation code</li>
+            <li>Users can download the eSIM profile using the activation code</li>
+        </ol>
+    </div>
+</body>
+</html>
+EOF
+
+# Create SSL directory
+mkdir -p ssl
+
+# Set permissions
+chmod +x docker-compose.yml
+chmod 600 .env
+
+# Start services
+print_status "Starting Docker containers..."
+docker-compose up -d --build
+
+# Wait for services to start
+print_status "Waiting for services to start..."
+sleep 30
+
+# Generate SSL certificate
+print_status "Generating SSL certificate..."
+certbot certonly --nginx --non-interactive --agree-tos --email $EMAIL -d $DOMAIN
+
+# Copy SSL certificates
+print_status "Configuring SSL certificates..."
+cp /etc/letsencrypt/live/$DOMAIN/fullchain.pem ssl/cert.pem
+cp /etc/letsencrypt/live/$DOMAIN/privkey.pem ssl/key.pem
+
+# Restart Nginx to apply SSL
+docker-compose restart nginx
+
+# Set up automatic SSL renewal
+print_status "Setting up automatic SSL renewal..."
+(crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet --post-hook 'cd $INSTALL_DIR && docker-compose restart nginx'") | crontab -
+
+# Print access information
+print_status "Deployment completed successfully!"
+echo ""
+echo "=============================================="
+echo "Private 5ber eSIM Manager is now running!"
+echo "=============================================="
+echo ""
+echo "Access URL: https://$DOMAIN:$SSL_PORT"
+echo "Web Port: $WEB_PORT"
+echo "Database Port: $DB_PORT"
+echo "Redis Port: $REDIS_PORT"
+echo "Nginx Port: $NGINX_PORT"
+echo "SSL Port: $SSL_PORT"
+echo ""
+echo "Note: All ports are set to non-standard values (20000+)"
+echo "Make sure your firewall allows these ports:"
+echo "  - $WEB_PORT (Flask app)"
+echo "  - $DB_PORT (PostgreSQL)"
+echo "  - $REDIS_PORT (Redis)"
+echo "  - $NGINX_PORT (HTTP)"
+echo "  - $SSL_PORT (HTTPS)"
+echo ""
+echo "To manage the application:"
+echo "  - cd $INSTALL_DIR"
+echo "  - docker-compose ps"
+echo "  - docker-compose logs"
+echo ""
+echo "SSL certificates will auto-renew."
+echo "=============================================="
