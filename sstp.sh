@@ -1,103 +1,75 @@
 #!/bin/bash
-# sstp_auto.sh - 一键安装 SoftEther VPN Server (SSTP) 并添加用户
-# 自动检测依赖，已安装则跳过
+
+# sstp.sh - 一键安装 SSTP VPN 服务
+# 仅适用于 Ubuntu 系统
 
 set -e
 
-echo "=== 检查并安装依赖 ==="
-DEPENDENCIES=(build-essential gcc make libreadline-dev libssl-dev zlib1g-dev libncurses5-dev wget curl iptables)
-
-for pkg in "${DEPENDENCIES[@]}"; do
-    if dpkg -s "$pkg" &>/dev/null; then
-        echo "依赖 $pkg 已安装，跳过"
-    else
-        echo "依赖 $pkg 未安装，正在安装..."
-        apt-get update -y
-        apt-get install -y "$pkg"
-    fi
-done
-
-echo "=== 下载 SoftEther VPN Server ==="
-TMP_DIR="/tmp/softether"
-mkdir -p $TMP_DIR
-cd $TMP_DIR
-
-if [ ! -f vpnserver.tar.gz ]; then
-    wget -O vpnserver.tar.gz https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.60-9760-beta/softether-vpnserver-v4.60-9760-beta-2023.06.28-linux-x64-64bit.tar.gz
-else
-    echo "已存在下载文件，跳过"
+echo "检测系统环境..."
+if [ "$(id -u)" -ne 0 ]; then
+    echo "请使用 root 用户执行此脚本！"
+    exit 1
 fi
 
-if [ ! -d vpnserver ]; then
-    tar xzf vpnserver.tar.gz
-else
-    echo "已存在解压目录，跳过"
+# 更新系统
+apt update -y
+apt upgrade -y
+
+# 安装依赖
+echo "安装依赖包..."
+apt install -y build-essential libssl-dev libreadline-dev libncurses5-dev libpam0g-dev libpcap-dev git wget curl iptables-persistent
+
+# 安装 SSTP Server
+echo "下载并编译 SSTP Server..."
+cd /usr/local/src
+if [ ! -d "sstp-server" ]; then
+    git clone https://github.com/enaess/stable-sstp-server.git sstp-server
 fi
+cd sstp-server
+make
+make install
 
-echo "=== 编译 SoftEther VPN Server ==="
-cd vpnserver
-if [ ! -f vpnserver/vpnserver ]; then
-    yes 1 | make
-else
-    echo "vpnserver 已编译，跳过"
-fi
+# 创建证书
+echo "生成自签名证书..."
+mkdir -p /etc/ssl/sstp
+cd /etc/ssl/sstp
+openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
+    -subj "/C=US/ST=CA/L=SanFrancisco/O=MyVPN/OU=IT/CN=sstp.local" \
+    -keyout server.key -out server.crt
 
-echo "=== 安装并设置开机自启 ==="
-cd ..
-if [ ! -d /usr/local/vpnserver ]; then
-    mv vpnserver /usr/local/
-fi
-
-chmod 600 /usr/local/vpnserver/*
-chmod 700 /usr/local/vpnserver/vpnserver
-chmod 700 /usr/local/vpnserver/vpncmd
-
-cat >/etc/systemd/system/vpnserver.service <<EOF
-[Unit]
-Description=SoftEther VPN Server
-After=network.target
-
-[Service]
-Type=forking
-ExecStart=/usr/local/vpnserver/vpnserver start
-ExecStop=/usr/local/vpnserver/vpnserver stop
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable vpnserver
-systemctl start vpnserver
-
-echo "=== 配置 SSTP 用户 ==="
-VPNCMD="/usr/local/vpnserver/vpncmd /SERVER localhost /ADMINHUB:DEFAULT /CMD"
-
-# 设置管理员密码
-$VPNCMD "ServerPasswordSet password"
-
-# 创建用户 user1~user10
+# 创建 SSTP 用户
+echo "创建用户 user1~user10..."
 for i in $(seq 1 10); do
-    $VPNCMD "UserCreate user$i /GROUP:none /REALNAME:none /NOTE:none" || echo "用户 user$i 已存在，跳过"
-    $VPNCMD "UserPasswordSet user$i /PASSWORD:password"
+    user="user$i"
+    password="password"
+    # 使用 SSTP Server 内部用户文件
+    echo "$user:$password" >> /etc/ppp/chap-secrets
 done
 
-echo "=== 配置 NAT ==="
-IFACE=$(ip route | grep '^default' | awk '{print $5}')
-iptables -t nat -C POSTROUTING -o $IFACE -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
-iptables -C FORWARD -s 192.168.30.0/24 -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -s 192.168.30.0/24 -j ACCEPT
+chmod 600 /etc/ppp/chap-secrets
 
-iptables-save > /etc/iptables.rules
-
-cat >/etc/network/if-up.d/iptables <<EOF
-#!/bin/sh
-iptables-restore < /etc/iptables.rules
+# 配置 SSTP Server
+echo "配置 SSTP 服务..."
+cat > /etc/sstp-server.conf <<EOF
+# SSTP Server 配置
+listen_port 443
+cert_file /etc/ssl/sstp/server.crt
+key_file /etc/ssl/sstp/server.key
 EOF
-chmod +x /etc/network/if-up.d/iptables
 
-echo "=== 安装完成 ==="
-echo "SSTP VPN 已启动，用户 user1~user10, 密码 password"
-echo "请在客户端选择 SSTP 协议，服务器地址使用 VPS 公网 IP"
+# 配置防火墙
+echo "允许 TCP/UDP 所有流量..."
+iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+iptables -I INPUT -p udp -j ACCEPT
+iptables-save > /etc/iptables/rules.v4
+
+# 启动 SSTP 服务
+echo "启动 SSTP 服务..."
+sstpd -c /etc/sstp-server.conf
+
+echo "=========================================="
+echo "SSTP VPN 安装完成！"
+echo "用户: user1~user10"
+echo "密码: password"
+echo "请确保客户端使用 TCP 443 连接"
+echo "=========================================="
