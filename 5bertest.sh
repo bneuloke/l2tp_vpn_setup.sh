@@ -1,7 +1,8 @@
 #!/bin/bash
-# private-5ber 一键部署脚本
-# 适用 Ubuntu VPS + Docker + Cloudflare 代理
-# 请确认你已经开放 TCP/UDP 端口，域名已解析到本机 IP
+# private-5ber 一键部署升级版
+# 适用于 Ubuntu VPS + Cloudflare Flexible HTTPS + Docker
+# 域名: wrxilove.dpdns.org
+# VPS IP: 98.85.252.221
 
 # -------------------------------
 # 配置区
@@ -12,14 +13,15 @@ ADMIN_USER="admin"
 ADMIN_PASS="admin123"               # 初始密码，部署后登录修改
 
 # -------------------------------
-# 安装 Docker & Docker Compose
+# 更新系统 & 安装依赖
 # -------------------------------
 echo "[*] 更新系统..."
 sudo apt update -y && sudo apt upgrade -y
-
-echo "[*] 安装依赖..."
 sudo apt install -y curl wget git ufw
 
+# -------------------------------
+# 安装 Docker & Docker Compose
+# -------------------------------
 echo "[*] 安装 Docker..."
 curl -fsSL https://get.docker.com -o get-docker.sh
 sudo sh get-docker.sh
@@ -43,7 +45,6 @@ cd $APP_DIR
 # -------------------------------
 # 创建 Flask 后端文件
 # -------------------------------
-echo "[*] 创建后端文件..."
 mkdir -p backend
 cat > backend/requirements.txt <<EOL
 Flask==2.3.5
@@ -92,7 +93,7 @@ EOL
 cat > backend/app.py <<'EOL'
 from flask import Flask, request, send_file, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, login_user, logout_user, login_required, UserMixin, current_user
+from flask_login import LoginManager, login_user, logout_user, login_required, UserMixin
 import os
 from werkzeug.security import generate_password_hash, check_password_hash
 from models import db, User, Profile
@@ -194,7 +195,7 @@ CMD ["python","app.py"]
 EOL
 
 # -------------------------------
-# 创建 Docker Compose
+# Docker Compose & Nginx
 # -------------------------------
 cat > docker-compose.yml <<EOL
 version: "3"
@@ -241,6 +242,7 @@ EOL
 echo "[*] 启动 Docker Compose 服务..."
 sudo docker-compose up -d --build
 
-echo "[*] 部署完成！访问地址：http://${DOMAIN} （Cloudflare 代理启用 HTTPS）"
+echo "[*] 部署完成！"
+echo "[*] 访问地址：https://${DOMAIN} （Cloudflare Flexible HTTPS）"
 echo "[*] 默认管理员账号 / 密码: ${ADMIN_USER} / ${ADMIN_PASS}"
-echo "[*] 请首次登录后立即修改密码，并设置强密钥 ESIM_MASTER_KEY"
+echo "[*] 请首次登录后修改密码，并修改 ESIM_MASTER_KEY 为强密钥"
